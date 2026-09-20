@@ -47,8 +47,9 @@ const contact = {
   comment:     process.env.COMMENT      ?? '',
 };
 
-const STATE_FILE = './poll-state.json';
-const POLL_MS    = 1 * 1000;   // 1 second
+const STATE_FILE  = './poll-state.json';
+const BOOKED_FILE = './.booked';  // exists = already booked, delete to re-enable
+const POLL_MS     = 1 * 1000;   // 1 second
 
 // Window can be overridden: WINDOW_START=23:59:30 WINDOW_DURATION=30 node poll.js --watch
 const [WINDOW_START_H, WINDOW_START_M, WINDOW_START_S] = (process.env.WINDOW_START ?? '23:50:00').split(':').map(Number);
@@ -335,6 +336,7 @@ async function tryBookDate(date) {
     log(`BOOKED! ${date} at ${chosen} — booking ID: ${bookingId}`);
     notify('Lilla Ego BOOKED', `${date} at ${chosen} for ${PARTY_SIZE} — ID ${bookingId}`);
     writeFileSync('booking-result.json', JSON.stringify(result.data, null, 2));
+    writeFileSync(BOOKED_FILE, `${date} at ${chosen} — ID ${bookingId}\n`);
   } else {
     log(`Booking failed: ${JSON.stringify(result.data?.errors ?? result.data?.message ?? result.data)}`);
     notify('Lilla Ego booking failed', `${date} ${chosen} — check booking-result.json`);
@@ -356,6 +358,11 @@ async function check() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function run() {
+  if (existsSync(BOOKED_FILE)) {
+    log(`Booking already made — delete ${BOOKED_FILE} to re-enable.`);
+    return;
+  }
+
   if (!WATCH) {
     await check();
     return;
