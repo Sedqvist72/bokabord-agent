@@ -49,7 +49,6 @@ const contact = {
 
 const STATE_FILE = './poll-state.json';
 const POLL_MS    = 1 * 1000;   // 1 second
-const WIDGET_URL = `https://app.bokabord.se/reservation/?app_type=bokabord&from_url=bokabord_fat&hash=${RESTAURANT_HASH}&is_bokabord_web=Y`;
 
 // Window can be overridden: WINDOW_START=23:59:30 WINDOW_DURATION=30 node poll.js --watch
 const [WINDOW_START_H, WINDOW_START_M, WINDOW_START_S] = (process.env.WINDOW_START ?? '23:50:00').split(':').map(Number);
@@ -157,15 +156,17 @@ function scheduleSystemWake(targetDate) {
 // ─── Notifications ────────────────────────────────────────────────────────────
 
 function notify(title, msg) {
-  // Strip non-ASCII to avoid AppleScript encoding issues
-  const safe  = msg.replace(/[^\x20-\x7E]/g, '-').replace(/"/g, '\\"');
-  const safeT = title.replace(/[^\x20-\x7E]/g, '-').replace(/"/g, '\\"');
-  try {
-    execSync(`osascript -e 'display notification "${safe}" with title "${safeT}"'`, { stdio: 'pipe' });
-  } catch (e) {
-    log(`notify error: ${e.stderr?.toString().trim() ?? e.message}`);
-  }
   log(`*** ${title}: ${msg} ***`);
+  if (process.platform === 'darwin') {
+    // Strip non-ASCII to avoid AppleScript encoding issues
+    const safe  = msg.replace(/[^\x20-\x7E]/g, '-').replace(/"/g, '\\"');
+    const safeT = title.replace(/[^\x20-\x7E]/g, '-').replace(/"/g, '\\"');
+    try {
+      execSync(`osascript -e 'display notification "${safe}" with title "${safeT}"'`, { stdio: 'pipe' });
+    } catch (e) {
+      log(`notify error: ${e.stderr?.toString().trim() ?? e.message}`);
+    }
+  }
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -179,98 +180,32 @@ function saveState(s) {
   writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
 }
 
-// ─── Stealth browser context ──────────────────────────────────────────────────
-
-async function newPage(browser) {
-  const ctx = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-    locale: 'sv-SE',
-    timezoneId: 'Europe/Stockholm',
-  });
-  const page = await ctx.newPage();
-  // Remove the webdriver flag that sites use to detect automation
-  await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
-  return page;
-}
-
-async function launchBrowser() {
-  const { chromium } = await import('playwright');
-  return chromium.launch({
-    headless: true,
-    args: ['--disable-blink-features=AutomationControlled'],
-  });
-}
-
-// ─── Browser poll ─────────────────────────────────────────────────────────────
-
-async function fetchCalendar() {
-  const browser = await launchBrowser();
-  const page    = await newPage(browser);
-
-  // Block analytics so we leave no tracking footprint
-  await page.route('**google**', r => r.abort());
-  await page.route('**gtm**',    r => r.abort());
-  await page.route('**analytics**', r => r.abort());
-
-  await page.goto(WIDGET_URL, { waitUntil: 'networkidle', timeout: 30_000 });
-
-  const meals = await page.evaluate(() => {
-    const ctrl = document.querySelector('[ng-controller]');
-    if (!ctrl) return null;
-    const scope = angular.element(ctrl).scope();
-    const raw = scope?.meals ?? {};
-    const out = {};
-    for (const [id, m] of Object.entries(raw))
-      out[id] = { name: m.name, calendar: m.calendar ?? {} };
-    return out;
-  });
-
-  await browser.close();
-  return meals;
-}
-
 // ─── Fetch available times for a specific date ────────────────────────────────
 
 async function fetchTimes(date) {
-  const browser = await launchBrowser();
-  const page    = await newPage(browser);
+  const res = await fetch('https://app.bokabord.se/booking-widget/api/getTimes', {
+    method:  'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Origin':  'https://app.bokabord.se',
+      'Referer': 'https://app.bokabord.se/',
+    },
+    body: JSON.stringify({
+      hash:      RESTAURANT_HASH,
+      mealid:    MEAL_ID,
+      date,
+      amount:    PARTY_SIZE,
+      date_code: '',
+    }),
+  });
 
-  await page.route('**google**',    r => r.abort());
-  await page.route('**gtm**',       r => r.abort());
-  await page.route('**analytics**', r => r.abort());
-
-  await page.goto(WIDGET_URL, { waitUntil: 'networkidle', timeout: 30_000 });
-
-  // Arm the response waiter BEFORE triggering the navigation
-  const responsePromise = page.waitForResponse(
-    r => r.url().includes('/booking-widget/api/getTimes'),
-    { timeout: 10_000 }
-  );
-
-  await page.evaluate(({ mealId, date, partySize }) => {
-    const ctrl  = document.querySelector('[ng-controller]');
-    const scope = angular.element(ctrl).scope();
-    const state = angular.element(ctrl).injector().get('$state');
-    scope.$apply(() => {
-      scope.booking.mealid = mealId;
-      scope.booking.meal   = scope.meals[mealId];
-      scope.booking.amount = partySize;
-      scope.booking.date   = moment(date);
-    });
-    state.go('time');
-  }, { mealId: MEAL_ID, date, partySize: PARTY_SIZE });
-
-  const res = await responsePromise.catch(() => null);
-  const data = res ? await res.json().catch(() => null) : null;
-
-  await browser.close();
+  const data = await res.json().catch(() => null);
 
   if (!data?.times) return { times: [], durations: {} };
   // times: { "57600": ["17:00", timestamp], ... }
   // lengths: { mealid: { "17:00": 150, ... } }
-  const times     = Object.values(data.times).map(v => v[0]).sort();
-  const durMap    = data.lengths?.[MEAL_ID] ?? {};
+  const times  = Object.values(data.times).map(v => v[0]).sort();
+  const durMap = data.lengths?.[MEAL_ID] ?? {};
   return { times, durations: durMap };
 }
 
@@ -441,10 +376,14 @@ async function run() {
 
     log(`Stockholm ${pad(h)}:${pad(m)}:${pad(s)} — outside window. ${Math.floor(mins/60)}h ${mins%60}m until ${windowStartStr}.`);
 
-    scheduleLaunchdWake(startDate);
-    scheduleSystemWake(startDate);
+    if (process.platform === 'darwin') {
+      scheduleLaunchdWake(startDate);
+      scheduleSystemWake(startDate);
+      log(`Sleeping. Mac will wake at ${windowStartStr} — you can close the lid now.`);
+    } else {
+      log(`Sleeping until ${windowStartStr}.`);
+    }
 
-    log(`Sleeping. Mac will wake at ${windowStartStr} — you can close the lid now.`);
     await new Promise(r => setTimeout(r, ms));
     log(`${windowStartStr} reached — starting poll.`);
   }
@@ -466,15 +405,6 @@ async function run() {
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
     if (done) { log('Done.'); process.exit(0); }
 
-    // Check calendar — if targetDate is released there, no point retrying fetchTimes
-    const meals = await fetchCalendar().catch(() => null);
-    if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
-      log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
-      saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
-      notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      process.exit(0);
-    }
-
     log(`Not released yet (${i + 1}/${DIRECT_RETRIES}), retrying in 1s...`);
     await new Promise(r => setTimeout(r, 1000));
   }
@@ -490,14 +420,6 @@ async function run() {
 
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
     if (done) { log('Done.'); process.exit(0); }
-
-    const meals = await fetchCalendar().catch(() => null);
-    if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
-      log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
-      saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
-      notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      process.exit(0);
-    }
 
     const secsLeft = Math.round((windowEndMs - Date.now()) / 1_000);
     log(`Still not released — ${secsLeft}s remaining.`);
