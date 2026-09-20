@@ -1,0 +1,13 @@
+{
+  "name": "bokabord-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "watch": "node poll.js --watch",
+    "check": "node poll.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0",
+    "dotenv": "^16.4.0"
+  }
+}

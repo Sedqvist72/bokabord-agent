@@ -1,0 +1,9 @@
+.env
+node_modules/
+*.png
+poll.log
+poll-state.json
+new-slots.json
+session.json
+api-calls.json
+booking-result.json
