@@ -432,8 +432,23 @@ async function run() {
     log(`Still not released — ${secsLeft}s remaining.`);
   }
 
-  log(`5 min window expired. No release for ${targetDate}.`);
-  notify('Lilla Ego', `${targetDate}: no release after 5 min of polling`);
+  log(`5 min window expired — switching to poll every 1 min for 3 hours.`);
+
+  const LONG_POLL_MS  = 60_000;
+  const longEndMs     = Date.now() + 3 * 60 * 60_000;
+
+  while (Date.now() < longEndMs) {
+    await new Promise(r => setTimeout(r, LONG_POLL_MS));
+
+    const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
+    if (done) { log('Done.'); process.exit(0); }
+
+    const minsLeft = Math.round((longEndMs - Date.now()) / 60_000);
+    log(`Still not released — ${minsLeft} min remaining.`);
+  }
+
+  log(`3 hour window expired. No release for ${targetDate}.`);
+  notify('Lilla Ego', `${targetDate}: no release after 3 hours of polling`);
 }
 
 run().catch(err => { console.error('Fatal:', err.message); process.exit(1); });
