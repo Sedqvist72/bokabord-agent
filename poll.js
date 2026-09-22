@@ -21,7 +21,6 @@
  */
 
 import { writeFileSync, readFileSync, existsSync, appendFileSync } from 'fs';
-import { execSync } from 'child_process';
 import 'dotenv/config';
 
 const LOG_FILE = './poll.log';
@@ -91,84 +90,10 @@ function msUntilWindowStart() {
   return secsUntil * 1000;
 }
 
-// Schedule a wake via launchd user agent (no sudo required).
-// launchd fires the job at StartCalendarInterval and wakes the Mac if asleep.
-function scheduleLaunchdWake(targetDate) {
-  const pad = n => String(n).padStart(2, '0');
-  // Use local time for launchd calendar interval
-  const hh = targetDate.getHours();
-  const mm = targetDate.getMinutes();
-  const nodeBin = process.execPath;
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>             <string>se.bokabord.poll-wake</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${nodeBin}</string>
-    <string>${process.argv[1]}</string>
-    <string>--watch</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>   <integer>${hh}</integer>
-    <key>Minute</key> <integer>${mm}</integer>
-    <key>Second</key> <integer>0</integer>
-  </dict>
-  <key>WorkingDirectory</key> <string>${process.cwd()}</string>
-  <key>RunAtLoad</key> <false/>
-</dict>
-</plist>`;
-
-  const agentsDir = `${process.env.HOME}/Library/LaunchAgents`;
-  const plistPath = `${agentsDir}/se.bokabord.poll-wake.plist`;
-  try {
-    execSync(`mkdir -p "${agentsDir}"`);
-    writeFileSync(plistPath, plist);
-    execSync(`launchctl unload "${plistPath}" 2>/dev/null; launchctl load "${plistPath}"`, { stdio: 'pipe' });
-    log(`launchd agent installed — will wake Mac at ${pad(hh)}:${pad(mm)} local time`);
-  } catch (e) {
-    log(`launchd scheduling failed: ${e.message}`);
-  }
-}
-
-// Schedule a macOS wake event so the Mac wakes from sleep at the target time.
-// pmset uses local system time (should match Stockholm if Mac timezone is correct).
-function scheduleSystemWake(targetDate) {
-  const pad = n => String(n).padStart(2, '0');
-  const mo = pad(targetDate.getMonth() + 1);
-  const dy = pad(targetDate.getDate());
-  const yr = String(targetDate.getFullYear()).slice(-2);
-  const hh = pad(targetDate.getHours());
-  const mm = pad(targetDate.getMinutes());
-  const ss = pad(targetDate.getSeconds());
-  const dateStr = `${mo}/${dy}/${yr} ${hh}:${mm}:${ss}`;
-
-  try {
-    execSync(`pmset schedule wake "${dateStr}"`, { stdio: 'pipe' });
-    log(`System wake scheduled via pmset for ${dateStr} (local time)`);
-    return true;
-  } catch {
-    log(`Note: pmset wake scheduling failed — falling back to launchd.`);
-    return false;
-  }
-}
-
 // ─── Notifications ────────────────────────────────────────────────────────────
 
 function notify(title, msg) {
   log(`*** ${title}: ${msg} ***`);
-  if (process.platform === 'darwin') {
-    // Strip non-ASCII to avoid AppleScript encoding issues
-    const safe  = msg.replace(/[^\x20-\x7E]/g, '-').replace(/"/g, '\\"');
-    const safeT = title.replace(/[^\x20-\x7E]/g, '-').replace(/"/g, '\\"');
-    try {
-      execSync(`osascript -e 'display notification "${safe}" with title "${safeT}"'`, { stdio: 'pipe' });
-    } catch (e) {
-      log(`notify error: ${e.stderr?.toString().trim() ?? e.message}`);
-    }
-  }
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -387,25 +312,13 @@ async function run() {
   // If outside the window, schedule a system wake and wait until midnight
   const pad = n => String(n).padStart(2, '0');
   const windowStartStr = `${pad(WINDOW_START_H)}:${pad(WINDOW_START_M)}:${pad(WINDOW_START_S)}`;
-  const windowEndH = Math.floor(WINDOW_END_SEC / 3600) % 24;
-  const windowEndM = Math.floor((WINDOW_END_SEC % 3600) / 60);
-  const windowEndStr = `${pad(windowEndH)}:${pad(windowEndM)}`;
-
   if (!inPollWindow()) {
     const ms  = msUntilWindowStart();
     const mins = Math.round(ms / 60_000);
     const { h, m, s } = stockholmTime();
-    const startDate = new Date(Date.now() + ms);
 
     log(`Stockholm ${pad(h)}:${pad(m)}:${pad(s)} — outside window. ${Math.floor(mins/60)}h ${mins%60}m until ${windowStartStr}.`);
-
-    if (process.platform === 'darwin') {
-      scheduleLaunchdWake(startDate);
-      scheduleSystemWake(startDate);
-      log(`Sleeping. Mac will wake at ${windowStartStr} — you can close the lid now.`);
-    } else {
-      log(`Sleeping until ${windowStartStr}.`);
-    }
+    log(`Sleeping until ${windowStartStr}.`);
 
     await new Promise(r => setTimeout(r, ms));
     log(`${windowStartStr} reached — starting poll.`);
