@@ -182,90 +182,42 @@ function saveState(s) {
   writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
 }
 
-// ─── Stealth browser context ──────────────────────────────────────────────────
-
-async function newPage(browser) {
-  const ctx = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-    locale: 'sv-SE',
-    timezoneId: 'Europe/Stockholm',
-  });
-  const page = await ctx.newPage();
-  await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
-  return page;
-}
-
-async function launchBrowser() {
-  const { chromium } = await import('playwright');
-  return chromium.launch({
-    headless: true,
-    args: ['--disable-blink-features=AutomationControlled'],
-  });
-}
-
 // ─── Calendar check — distinguishes "not released" from "released but full" ──
+// The server embeds `var meals = {...}` in the widget HTML, including each
+// meal's calendar object. A plain GET + brace-count parse extracts it without
+// needing a browser.
 
 async function fetchCalendar() {
-  const browser = await launchBrowser();
-  const page    = await newPage(browser);
-
-  await page.route('**google**',    r => r.abort());
-  await page.route('**gtm**',       r => r.abort());
-  await page.route('**analytics**', r => r.abort());
-
-  await page.goto(WIDGET_URL, { waitUntil: 'networkidle', timeout: 30_000 });
-
-  const meals = await page.evaluate(() => {
-    const ctrl = document.querySelector('[ng-controller]');
-    if (!ctrl) return null;
-    const scope = angular.element(ctrl).scope();
-    const raw = scope?.meals ?? {};
-    const out = {};
-    for (const [id, m] of Object.entries(raw))
-      out[id] = { name: m.name, calendar: m.calendar ?? {} };
-    return out;
+  const res  = await fetch(WIDGET_URL, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
   });
+  const html = await res.text();
 
-  await browser.close();
-  return meals;
+  const marker = 'var meals = ';
+  const start  = html.indexOf(marker);
+  if (start === -1) return null;
+
+  let depth = 0, i = html.indexOf('{', start);
+  for (; i < html.length; i++) {
+    if (html[i] === '{') depth++;
+    else if (html[i] === '}') { depth--; if (depth === 0) break; }
+  }
+
+  const meals = JSON.parse(html.slice(html.indexOf('{', start), i + 1));
+  return Object.fromEntries(
+    Object.entries(meals).map(([id, m]) => [id, { name: m.name, calendar: m.calendar ?? {} }])
+  );
 }
 
 // ─── Fetch available times for a specific date ────────────────────────────────
 
 async function fetchTimes(date) {
-  const browser = await launchBrowser();
-  const page    = await newPage(browser);
-
-  await page.route('**google**',    r => r.abort());
-  await page.route('**gtm**',       r => r.abort());
-  await page.route('**analytics**', r => r.abort());
-
-  await page.goto(WIDGET_URL, { waitUntil: 'networkidle', timeout: 30_000 });
-
-  const responsePromise = page.waitForResponse(
-    r => r.url().includes('/booking-widget/api/getTimes'),
-    { timeout: 10_000 }
-  );
-
-  await page.evaluate(({ mealId, date, partySize }) => {
-    const ctrl  = document.querySelector('[ng-controller]');
-    const scope = angular.element(ctrl).scope();
-    const state = angular.element(ctrl).injector().get('$state');
-    scope.$apply(() => {
-      scope.booking.mealid = mealId;
-      scope.booking.meal   = scope.meals[mealId];
-      scope.booking.amount = partySize;
-      scope.booking.date   = moment(date);
-    });
-    state.go('time');
-  }, { mealId: MEAL_ID, date, partySize: PARTY_SIZE });
-
-  const res  = await responsePromise.catch(() => null);
-  const data = res ? await res.json().catch(() => null) : null;
-
-  await browser.close();
-
+  const res = await fetch('https://app.bokabord.se/booking-widget/api/getTimes', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://app.bokabord.se', Referer: 'https://app.bokabord.se/' },
+    body: JSON.stringify({ hash: RESTAURANT_HASH, mealid: MEAL_ID, date, amount: PARTY_SIZE, date_code: '' }),
+  });
+  const data = await res.json().catch(() => null);
   if (!data?.times) return { times: [], durations: {} };
   // times: { "57600": ["17:00", timestamp], ... }
   // lengths: { mealid: { "17:00": 150, ... } }
