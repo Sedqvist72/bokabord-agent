@@ -287,6 +287,36 @@ async function tryBookDate(date) {
   return true;
 }
 
+// ─── Nightly log email via Resend ────────────────────────────────────────────
+
+let logStartPos = 0;
+
+async function sendNightLog(subject) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return;
+  try {
+    const body = readFileSync(LOG_FILE).slice(logStartPos).toString('utf8').trim();
+    await fetch('https://api.resend.com/emails', {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from:    'Bokabord Agent <onboarding@resend.dev>',
+        to:      contact.email,
+        subject: `Bokabord ${subject}`,
+        text:    body || '(no log)',
+      }),
+    });
+    log('Night log emailed.');
+  } catch (e) {
+    log(`sendNightLog error: ${e.message}`);
+  }
+}
+
+async function finish(subject) {
+  await sendNightLog(subject);
+  process.exit(0);
+}
+
 // ─── One-shot check (used for --check mode) ───────────────────────────────────
 
 async function check() {
@@ -303,6 +333,8 @@ async function run() {
     log(`Booking already made — delete ${BOOKED_FILE} to re-enable.`);
     return;
   }
+
+  logStartPos = existsSync(LOG_FILE) ? readFileSync(LOG_FILE).length : 0;
 
   if (!WATCH) {
     await check();
@@ -339,14 +371,14 @@ async function run() {
   const DIRECT_RETRIES = 30;
   for (let i = 0; i < DIRECT_RETRIES; i++) {
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
-    if (done) { log('Done.'); process.exit(0); }
+    if (done) { log('Done.'); await finish(`${targetDate} — done`); }
 
     const meals = await fetchCalendar().catch(() => null);
     if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
       log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
       saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
       notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      process.exit(0);
+      await finish(`${targetDate} — released, no slots for ${PARTY_SIZE}`);
     }
 
     log(`Not released yet (${i + 1}/${DIRECT_RETRIES}), retrying in 1s...`);
@@ -363,14 +395,14 @@ async function run() {
     await new Promise(r => setTimeout(r, SLOW_POLL_MS));
 
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
-    if (done) { log('Done.'); process.exit(0); }
+    if (done) { log('Done.'); await finish(`${targetDate} — done`); }
 
     const meals = await fetchCalendar().catch(() => null);
     if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
       log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
       saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
       notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      process.exit(0);
+      await finish(`${targetDate} — released, no slots for ${PARTY_SIZE}`);
     }
 
     const secsLeft = Math.round((windowEndMs - Date.now()) / 1_000);
@@ -386,14 +418,14 @@ async function run() {
     await new Promise(r => setTimeout(r, LONG_POLL_MS));
 
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
-    if (done) { log('Done.'); process.exit(0); }
+    if (done) { log('Done.'); await finish(`${targetDate} — done`); }
 
     const meals = await fetchCalendar().catch(() => null);
     if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
       log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
       saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
       notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      process.exit(0);
+      await finish(`${targetDate} — released, no slots for ${PARTY_SIZE}`);
     }
 
     const minsLeft = Math.round((longEndMs - Date.now()) / 60_000);
@@ -402,6 +434,7 @@ async function run() {
 
   log(`3 hour window expired. No release for ${targetDate}.`);
   notify('Lilla Ego', `${targetDate}: no release after 3 hours of polling`);
+  await sendNightLog(`${targetDate} — no release`);
 }
 
 run().catch(err => { console.error('Fatal:', err.message); process.exit(1); });
