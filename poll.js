@@ -27,7 +27,6 @@ const LOG_FILE = './poll.log';
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
-  console.log(line);
   appendFileSync(LOG_FILE, line + '\n');
 }
 
@@ -232,6 +231,43 @@ function msUntilMidnight() {
   return secsFromMidnight === 0 ? 0 : (24 * 3600 - secsFromMidnight) * 1000;
 }
 
+// ─── Blind booking attempt — skips fetchTimes, fires saveBooking immediately ──
+// Used at the first millisecond of midnight to avoid the fetchTimes round trip.
+
+async function tryDirectBook(date) {
+  log(`Blind booking attempt: ${date} at ${LATEST_TIME} for ${PARTY_SIZE}...`);
+
+  const hasContact = contact.firstName && contact.lastName && contact.email && contact.phone;
+  if (!hasContact) {
+    log('Skipping blind book — fill FIRST_NAME/LAST_NAME/EMAIL/PHONE in .env');
+    return false;
+  }
+
+  if (DRY_RUN) {
+    log(`[DRY RUN] Would blind-book ${date} at ${LATEST_TIME} for ${PARTY_SIZE}`);
+    return false;
+  }
+
+  const result = await bookSlot(date, LATEST_TIME, 0).catch(e => ({ error: e.message }));
+
+  if (result.error) {
+    log(`Blind book error: ${result.error}`);
+    return false;
+  }
+
+  if (result.data?.success || result.data?.bookingid) {
+    const bookingId = result.data?.bookingid ?? result.data?.id ?? '?';
+    log(`BOOKED! ${date} at ${LATEST_TIME} — booking ID: ${bookingId}`);
+    notify('Lilla Ego BOOKED', `${date} at ${LATEST_TIME} for ${PARTY_SIZE} — ID ${bookingId}`);
+    writeFileSync('booking-result.json', JSON.stringify(result.data, null, 2));
+    writeFileSync(BOOKED_FILE, `${date} at ${LATEST_TIME} — ID ${bookingId}\n`);
+    return true;
+  }
+
+  log(`Blind book failed: ${JSON.stringify(result.data?.errors ?? result.data?.message ?? result.data)}`);
+  return false;
+}
+
 // ─── Attempt direct booking for a known date ─────────────────────────────────
 
 async function tryBookDate(date) {
@@ -368,20 +404,22 @@ async function run() {
   const { lastOpen } = loadState();
   log(`Midnight — targeting ${targetDate} (30 days out)`);
 
+  const blindDone = await tryDirectBook(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
+  if (blindDone) { await finish(`${targetDate} — blind booked`); }
+
+  const calMeals = await fetchCalendar().catch(() => null);
+  if (calMeals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
+    log(`${targetDate} is in calendar — slots taken before blind book landed. Continuing to poll.`);
+  } else {
+    log(`${targetDate} not yet in calendar — date not released. Continuing to poll.`);
+  }
+
   const DIRECT_RETRIES = 30;
   for (let i = 0; i < DIRECT_RETRIES; i++) {
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
     if (done) { log('Done.'); await finish(`${targetDate} — done`); }
 
-    const meals = await fetchCalendar().catch(() => null);
-    if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
-      log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
-      saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
-      notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      await finish(`${targetDate} — released, no slots for ${PARTY_SIZE}`);
-    }
-
-    log(`Not released yet (${i + 1}/${DIRECT_RETRIES}), retrying in 1s...`);
+    log(`No slots (${i + 1}/${DIRECT_RETRIES}), retrying in 1s...`);
     await new Promise(r => setTimeout(r, 1000));
   }
 
@@ -397,16 +435,8 @@ async function run() {
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
     if (done) { log('Done.'); await finish(`${targetDate} — done`); }
 
-    const meals = await fetchCalendar().catch(() => null);
-    if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
-      log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
-      saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
-      notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      await finish(`${targetDate} — released, no slots for ${PARTY_SIZE}`);
-    }
-
     const secsLeft = Math.round((windowEndMs - Date.now()) / 1_000);
-    log(`Still not released — ${secsLeft}s remaining.`);
+    log(`No slots — ${secsLeft}s remaining in slow window.`);
   }
 
   log(`5 min window expired — switching to poll every 1 min for 3 hours.`);
@@ -420,16 +450,8 @@ async function run() {
     const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
     if (done) { log('Done.'); await finish(`${targetDate} — done`); }
 
-    const meals = await fetchCalendar().catch(() => null);
-    if (meals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
-      log(`${targetDate} confirmed in calendar — no slots for party of ${PARTY_SIZE}. Stopping.`);
-      saveState({ lastOpen: targetDate, checkedAt: new Date().toISOString() });
-      notify('Lilla Ego', `${targetDate}: released but no slots for ${PARTY_SIZE}`);
-      await finish(`${targetDate} — released, no slots for ${PARTY_SIZE}`);
-    }
-
     const minsLeft = Math.round((longEndMs - Date.now()) / 60_000);
-    log(`Still not released — ${minsLeft} min remaining.`);
+    log(`No slots — ${minsLeft} min remaining in long window.`);
   }
 
   log(`3 hour window expired. No release for ${targetDate}.`);
