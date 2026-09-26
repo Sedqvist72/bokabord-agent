@@ -29,6 +29,13 @@ function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
   appendFileSync(LOG_FILE, line + '\n');
 }
+// Suppress consecutive identical errors so a sustained outage logs once, not per-poll.
+let _lastErr = null;
+function logErr(msg) {
+  if (msg === _lastErr) return;
+  _lastErr = msg;
+  log(msg);
+}
 
 const RESTAURANT_HASH = 'a6ec81a26b9ea18ff9ba9852b8dcaa0b';
 const MEAL_ID         = '6518';   // Middag at Lilla Ego
@@ -107,30 +114,47 @@ function saveState(s) {
 }
 
 // ─── Calendar check — distinguishes "not released" from "released but full" ──
-// The server embeds `var meals = {...}` in the widget HTML, including each
-// meal's calendar object. A plain GET + brace-count parse extracts it without
-// needing a browser.
+// The `/widget/` and `/reservation/` HTML pages that used to embed
+// `var meals = {...}` now return 403 to non-browser clients. The same calendar
+// data is available as clean JSON from the getCalendar API (mirrors getTimes),
+// which is not behind the 403 rule. Each meal's `calendar` maps date → status
+// (1 = released/bookable, 0 = present but not released or a closed day).
 
 async function fetchCalendar() {
-  const res  = await fetch(WIDGET_URL, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' },
+  const res = await fetch('https://app.bokabord.se/booking-widget/api/getCalendar', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://app.bokabord.se', Referer: 'https://app.bokabord.se/' },
+    body: JSON.stringify({ hash: RESTAURANT_HASH, mealid: MEAL_ID, amount: PARTY_SIZE }),
   });
-  const html = await res.text();
-
-  const marker = 'var meals = ';
-  const start  = html.indexOf(marker);
-  if (start === -1) return null;
-
-  let depth = 0, i = html.indexOf('{', start);
-  for (; i < html.length; i++) {
-    if (html[i] === '{') depth++;
-    else if (html[i] === '}') { depth--; if (depth === 0) break; }
-  }
-
-  const meals = JSON.parse(html.slice(html.indexOf('{', start), i + 1));
+  const data = await res.json().catch(() => null);
+  if (!data?.meals) return null;
   return Object.fromEntries(
-    Object.entries(meals).map(([id, m]) => [id, { name: m.name, calendar: m.calendar ?? {} }])
+    Object.entries(data.meals).map(([id, m]) => [id, { name: m.name, calendar: m.calendar ?? {} }])
   );
+}
+
+// Weekdays (0=Sun … 6=Sat) the restaurant actually serves, inferred from any
+// released date in the calendar. Lilla Ego is closed Sun & Mon, so those never
+// appear with status 1. Used to skip nights whose target lands on a closed day.
+function servedWeekdays(calendar) {
+  const days = new Set();
+  for (const [d, v] of Object.entries(calendar)) {
+    if (v === 1) days.add(new Date(d + 'T00:00:00Z').getUTCDay());
+  }
+  return days;
+}
+
+// Announce (once) the moment the target date flips to released in the calendar,
+// even if no bookable slots are free yet ("released but full"). Called on the
+// polling heartbeat, not every iteration, to keep request volume down.
+let releaseAnnounced = false;
+async function announceReleaseIfNew(date) {
+  if (releaseAnnounced) return;
+  const cal = (await fetchCalendar().catch(() => null))?.[MEAL_ID]?.calendar ?? {};
+  if (cal[date] === 1) {
+    releaseAnnounced = true;
+    log(`*** ${date} RELEASED in calendar — no bookable slots for ${PARTY_SIZE} yet (released but full). Still polling. ***`);
+  }
 }
 
 // ─── Fetch available times for a specific date ────────────────────────────────
@@ -272,16 +296,13 @@ async function tryDirectBook(date) {
 
 async function tryBookDate(date) {
   const ts = new Date().toISOString();
-  log(`Fetching times for ${date} (party of ${PARTY_SIZE})...`);
 
   const { times, durations } = await fetchTimes(date)
-    .catch(e => { log(`fetchTimes error: ${e.message}`); return { times: [], durations: {} }; });
+    .catch(e => { logErr(`fetchTimes error: ${e.message}`); return { times: [], durations: {} }; });
 
-  log(`${date}: ${times.length ? times.join(', ') : 'no slots'}`);
+  if (!times.length) return false;   // silent — nothing bookable yet, don't log every poll
 
-  if (!times.length) return false;
-
-  notify('Lilla Ego', `${date}: ${times.join(' ')}`);
+  log(`*** ${date}: slots available — ${times.join(', ')} ***`);
   writeFileSync('new-slots.json', JSON.stringify({ date, times, at: ts }, null, 2));
 
   const chosen = pickSlot(times);
@@ -359,7 +380,8 @@ async function check() {
   const date = stockholmDateStr();
   const { h, m } = stockholmTime();
   log(`(Stockholm ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}) Checking ${date}…`);
-  await tryBookDate(date);
+  const found = await tryBookDate(date);
+  if (!found) log(`${date}: no slots.`);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -404,59 +426,76 @@ async function run() {
   const { lastOpen } = loadState();
   log(`Midnight — targeting ${targetDate} (30 days out)`);
 
+  // Skip nights where the target lands on a weekday the restaurant never serves
+  // (Lilla Ego is closed Sun & Mon). Fetch the calendar first; if it's
+  // unavailable we fall through and poll normally rather than risk skipping a
+  // real release on a fetch hiccup.
+  const WD        = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const calMeals  = await fetchCalendar().catch(() => null);
+  const calendar  = calMeals?.[MEAL_ID]?.calendar ?? {};
+  const served    = servedWeekdays(calendar);
+  const targetWd  = new Date(targetDate + 'T00:00:00Z').getUTCDay();
+  if (served.size && !served.has(targetWd)) {
+    log(`${targetDate} is a ${WD[targetWd]} — not served (open: ${[...served].sort().map(d => WD[d]).join(', ')}). Skipping tonight.`);
+    await finish(`${targetDate} — skipped (${WD[targetWd]}, closed)`);
+  }
+
   const blindDone = await tryDirectBook(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
   if (blindDone) { await finish(`${targetDate} — blind booked`); }
 
-  const calMeals = await fetchCalendar().catch(() => null);
-  if (calMeals?.[MEAL_ID]?.calendar?.[targetDate] === 1) {
+  if (calendar[targetDate] === 1) {
     log(`${targetDate} is in calendar — slots taken before blind book landed. Continuing to poll.`);
   } else {
     log(`${targetDate} not yet in calendar — date not released. Continuing to poll.`);
   }
 
+  // Phase 1 — fast retries (30 × 1s). Silent unless slots appear (tryBookDate
+  // logs those) or an error recurs.
   const DIRECT_RETRIES = 30;
   for (let i = 0; i < DIRECT_RETRIES; i++) {
-    const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
-    if (done) { log('Done.'); await finish(`${targetDate} — done`); }
-
-    log(`No slots (${i + 1}/${DIRECT_RETRIES}), retrying in 1s...`);
+    const done = await tryBookDate(targetDate).catch(err => { logErr(`Error: ${err.message}`); return false; });
+    if (done) { await finish(`${targetDate} — done`); }
     await new Promise(r => setTimeout(r, 1000));
   }
 
-  log(`No release after ${DIRECT_RETRIES} fast retries — switching to poll every 5s for 5 min.`);
-  notify('Lilla Ego', `${targetDate}: fast retries exhausted, polling every 5s`);
-
+  // Phase 2 — back off to every 5s for 5 min.
+  log(`No release after ${DIRECT_RETRIES}s of fast retries — polling every 5s for 5 min.`);
   const SLOW_POLL_MS = 5_000;
   const windowEndMs  = Date.now() + 5 * 60_000;
-
   while (Date.now() < windowEndMs) {
     await new Promise(r => setTimeout(r, SLOW_POLL_MS));
-
-    const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
-    if (done) { log('Done.'); await finish(`${targetDate} — done`); }
-
-    const secsLeft = Math.round((windowEndMs - Date.now()) / 1_000);
-    log(`No slots — ${secsLeft}s remaining in slow window.`);
+    const done = await tryBookDate(targetDate).catch(err => { logErr(`Error: ${err.message}`); return false; });
+    if (done) { await finish(`${targetDate} — done`); }
   }
 
-  log(`5 min window expired — switching to poll every 1 min for 3 hours.`);
-
+  // Phase 3 — long tail: every 1 min for 3 hours. One summary heartbeat every
+  // 30 min (with a calendar check that announces a release the moment it lands),
+  // instead of a line per poll.
+  log(`Still no release — polling every 1 min for 3 hours (30-min summaries).`);
   const LONG_POLL_MS  = 60_000;
-  const longEndMs     = Date.now() + 3 * 60 * 60_000;
+  const HEARTBEAT_MS  = 30 * 60_000;
+  const longStartMs   = Date.now();
+  const longEndMs     = longStartMs + 3 * 60 * 60_000;
+  let   nextHeartbeat = longStartMs + HEARTBEAT_MS;
+  let   polls         = 0;
 
   while (Date.now() < longEndMs) {
     await new Promise(r => setTimeout(r, LONG_POLL_MS));
+    polls++;
 
-    const done = await tryBookDate(targetDate).catch(err => { log(`Error: ${err.message}`); return false; });
-    if (done) { log('Done.'); await finish(`${targetDate} — done`); }
+    const done = await tryBookDate(targetDate).catch(err => { logErr(`Error: ${err.message}`); return false; });
+    if (done) { await finish(`${targetDate} — done`); }
 
-    const minsLeft = Math.round((longEndMs - Date.now()) / 60_000);
-    log(`No slots — ${minsLeft} min remaining in long window.`);
+    if (Date.now() >= nextHeartbeat) {
+      const mins = Math.round((Date.now() - longStartMs) / 60_000);
+      log(`Still polling ${targetDate} — no bookable slots after ${mins} min (${polls} checks).`);
+      await announceReleaseIfNew(targetDate);
+      nextHeartbeat += HEARTBEAT_MS;
+    }
   }
 
-  log(`3 hour window expired. No release for ${targetDate}.`);
-  notify('Lilla Ego', `${targetDate}: no release after 3 hours of polling`);
-  await sendNightLog(`${targetDate} — no release`);
+  log(`3 hour window expired. No bookable slots for ${targetDate}${releaseAnnounced ? ' (released but stayed full)' : ' (never released)'}.`);
+  await sendNightLog(`${targetDate} — no booking`);
 }
 
 run().catch(err => { console.error('Fatal:', err.message); process.exit(1); });
